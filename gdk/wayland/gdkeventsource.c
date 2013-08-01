@@ -49,6 +49,8 @@ gdk_event_source_prepare(GSource *base, gint *timeout)
   if (_gdk_event_queue_find_first (source->display) != NULL)
     return TRUE;
 
+  wl_display_dispatch_pending (display->wl_display);
+
   if (wl_display_flush (display->wl_display) < 0)
     g_error ("Error dispatching display: %s", g_strerror (errno));
 
