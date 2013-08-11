@@ -191,6 +191,10 @@ if USE_WAYLAND
 libgdk_3_la_LIBADD += wayland/libgdk-wayland.la
 endif
 
+if USE_MIR
+libgdk_3_la_LIBADD += mir/libgdk-mir.la
+endif
+
 if HAVE_INTROSPECTION
 
 introspection_files = 		\

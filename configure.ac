@@ -308,6 +308,10 @@ AC_ARG_ENABLE(wayland-backend,
               [AS_HELP_STRING([--enable-wayland-backend],
                               [enable the wayland gdk backend])],
 			      [backend_set=yes])
+AC_ARG_ENABLE(mir-backend,
+              [AS_HELP_STRING([--enable-mir-backend],
+                              [enable the mir gdk backend])],
+			      [backend_set=yes])
 
 if test -z "$backend_set"; then
   if test "$platform_win32" = yes; then
@@ -409,6 +413,22 @@ else
   AM_CONDITIONAL(USE_WAYLAND, false)
 fi
 AC_SUBST(DISABLE_ON_WAYLAND)
+
+DISABLE_ON_MIR=''
+if test "x$enable_mir_backend" = "xyes"; then
+  # For the cairo image backend
+  cairo_backends="$cairo_backends cairo"
+  GDK_BACKENDS="$GDK_BACKENDS mir"
+  have_gio_unix=yes
+  GDK_WINDOWING="$GDK_WINDOWING
+#define GDK_WINDOWING_MIR"
+  DISABLE_ON_MIR='%'
+  MIR_PACKAGES="mirclient >= 0.0.6"
+  AM_CONDITIONAL(USE_MIR, true)
+else
+  AM_CONDITIONAL(USE_MIR, false)
+fi
+AC_SUBST(DISABLE_ON_MIR)
 
 # strip leading space
 GDK_BACKENDS=${GDK_BACKENDS#* }
@@ -1279,7 +1299,7 @@ CFLAGS="$saved_cflags"
 LDFLAGS="$saved_ldflags"
 
 GDK_PACKAGES="$PANGO_PACKAGES gdk-pixbuf-2.0 cairo cairo-gobject"
-GDK_PRIVATE_PACKAGES="$GDK_GIO_PACKAGE $X_PACKAGES $WAYLAND_PACKAGES $cairo_backends"
+GDK_PRIVATE_PACKAGES="$GDK_GIO_PACKAGE $X_PACKAGES $WAYLAND_PACKAGES $MIR_PACKAGES $cairo_backends"
 if test "x$enable_x11_backend" = xyes; then
   GDK_PRIVATE_PACKAGES="$GDK_PRIVATE_PACKAGES pangoft2"
 fi
@@ -1832,6 +1852,7 @@ build/win32/vs9/Makefile
 build/win32/vs10/Makefile
 gdk/Makefile
 gdk/broadway/Makefile
+gdk/mir/Makefile
 gdk/x11/Makefile
 gdk/win32/Makefile
 gdk/win32/rc/Makefile
