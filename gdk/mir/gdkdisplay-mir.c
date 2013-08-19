@@ -429,23 +429,30 @@ send_fake_focus_change_event (GdkDisplay *event,
 {
 }
 
-void
+static void
 adjust_state_for_enter_event (GdkDisplay *display,
                               GdkEvent   *event)
 {
   _gdk_mir_window_add_focus (event->crossing.window);
 }
 
-void
+static void
 adjust_state_for_leave_event (GdkDisplay *display,
-                              GdkEvent    *event)
+                              GdkEvent   *event)
 {
   _gdk_mir_window_remove_focus (event->crossing.window);
 }
 
 static void
-gdk_mir_display_adjust_state_for_event_in_main_loop (GdkDisplay *display,
-                                                     GdkEvent   *event)
+handle_expose_event (GdkDisplay *display,
+                     GdkEvent   *event)
+{
+  _gdk_mir_window_frame_arrived_in_main_loop (event->expose.window);
+}
+
+static void
+gdk_mir_display_process_event_internal (GdkDisplay *display,
+                                        GdkEvent   *event)
 {
   switch (event->type)
     {
@@ -455,6 +462,8 @@ gdk_mir_display_adjust_state_for_event_in_main_loop (GdkDisplay *display,
     case GDK_LEAVE_NOTIFY:
       adjust_state_for_leave_event (display, event);
       break;
+    case GDK_EXPOSE:
+      handle_expose_event (display, event);
     default:
       break;
     }
@@ -472,7 +481,7 @@ gdk_mir_display_queue_events (GdkDisplay *display)
     {
       /* _gdk_windowing_got_event may free and unlink the event, so we
        * need to do any state adjustments here first */
-      gdk_mir_display_adjust_state_for_event_in_main_loop (display, event);
+      gdk_mir_display_process_event_internal (display, event);
       gdk_mir_display_deliver_event (display, event);
 
       event = (GdkEvent *) g_async_queue_try_pop (display_mir->event_queue);

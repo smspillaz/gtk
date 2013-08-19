@@ -46,6 +46,7 @@ void _gdk_mir_window_set_device_grabbed (GdkWindow *window,
 void _gdk_mir_window_generate_focus_event (GdkWindow *window,
 					   GdkWindow *last,
 					   GdkDevice *device);
+void _gdk_mir_window_frame_arrived_in_main_loop (GdkWindow *window);
 
 GdkKeymap *_gdk_mir_keymap_new (void);
 GdkCursor *_gdk_mir_display_get_cursor_for_type (GdkDisplay    *display,

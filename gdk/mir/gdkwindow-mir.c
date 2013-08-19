@@ -30,6 +30,7 @@
 #include "gdkprivate-mir.h"
 #include "gdkinternals.h"
 #include "gdkdeviceprivate.h"
+#include "gdkframeclockprivate.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -143,6 +144,8 @@ struct _GdkWindowImplMir
 
   guint32 grab_time;
   GdkDevice *grab_device;
+
+  gint64 pending_frame_counter;
 };
 
 struct _GdkWindowImplMirClass
@@ -151,6 +154,13 @@ struct _GdkWindowImplMirClass
 };
 
 G_DEFINE_TYPE (GdkWindowImplMir, _gdk_window_impl_mir, GDK_TYPE_WINDOW_IMPL)
+
+static void
+on_frame_clock_before_paint (GdkFrameClock *clock,
+                             GdkWindow     *window);
+static void
+on_frame_clock_after_paint (GdkFrameClock *clock,
+                            GdkWindow     *window);
 
 static void
 _gdk_window_impl_mir_init (GdkWindowImplMir *impl)
@@ -304,7 +314,8 @@ next_buffer_arrived (MirSurface *surface,
                                                   event);
 
   g_async_queue_push (impl->graphics_region_surface_queue,
-                      next_graphics_region_surface);}
+                      next_graphics_region_surface);
+}
 
 static void
 cairo_surface_destroy_notify_func (gpointer surface)
@@ -322,6 +333,7 @@ _gdk_mir_display_create_window_impl (GdkDisplay    *display,
 				     gint           attributes_mask)
 {
   GdkWindowImplMir *impl;
+  GdkFrameClock *frame_clock;
   const char *title;
 
   impl = g_object_new (GDK_TYPE_WINDOW_IMPL_MIR, NULL);
@@ -366,6 +378,15 @@ _gdk_mir_display_create_window_impl (GdkDisplay    *display,
   impl->cairo_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
                                                     window->width,
                                                     window->height);
+  impl->pending_frame_counter = 0;
+
+  /* Set up frame-clock */
+  frame_clock = gdk_window_get_frame_clock (window);
+
+  g_signal_connect (frame_clock, "before-paint",
+                    G_CALLBACK (on_frame_clock_before_paint), window);
+  g_signal_connect (frame_clock, "after-paint",
+                    G_CALLBACK (on_frame_clock_after_paint), window);
 }
 
 static void
@@ -1591,6 +1612,70 @@ gdk_mir_window_create_similar_image_surface (GdkWindow *     window,
   return cairo_image_surface_create (format, width, height);
 }
 
+void
+_gdk_mir_window_frame_arrived_in_main_loop (GdkWindow *window)
+{
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
+  GdkFrameClock *clock = gdk_window_get_frame_clock (window);
+  GdkFrameTimings *timings;
+
+  /* Thaw frame clock. We are now ready to process the next frame */
+  _gdk_frame_clock_thaw (clock);
+
+  /* Fetch current timings and reset pending_frame_counter - this signifies
+   * the start of a new frame */
+  timings = gdk_frame_clock_get_timings (clock, impl->pending_frame_counter);
+  impl->pending_frame_counter = 0;
+
+  if (timings == NULL)
+    return;
+
+  timings->refresh_interval = 16667; /* default to 1/60th of a second */
+
+  /* We don't know when the vblank period happened last, so guess
+   * somewhere in the middle of the current time + refresh period */
+  timings->presentation_time = (guint32) g_get_monotonic_time () / 1000 +
+                               timings->refresh_interval / 2;
+  timings->complete = TRUE;
+
+#ifdef G_ENABLE_DEBUG
+  if ((_gdk_debug_flags & GDK_DEBUG_FRAMES) != 0)
+    _gdk_frame_clock_debug_print_timings (clock, timings);
+#endif
+}
+
+static void
+on_frame_clock_before_paint (GdkFrameClock *clock,
+                             GdkWindow     *window)
+{
+  GdkFrameTimings *timings = gdk_frame_clock_get_current_timings (clock);
+  gint64 presentation_time;
+  gint64 refresh_interval;
+
+  gdk_frame_clock_get_refresh_info (clock,
+                                    timings->frame_time,
+                                    &refresh_interval, &presentation_time);
+
+  /* Assume a one-frame lag in time-to-actual presentation */
+  timings->predicted_presentation_time = presentation_time + refresh_interval;
+}
+
+static void
+on_frame_clock_after_paint (GdkFrameClock *clock,
+                            GdkWindow     *window)
+{
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
+
+  /* Determine the ID of the pending frame so that we can set timings
+   * in _gdk_mir_window_frame_arrived_in_main_loop */
+  impl->pending_frame_counter = gdk_frame_clock_get_frame_counter (clock);
+
+  /* Frame is now complete - swap buffers and wait for the next buffer
+   * to arrive */
+  mir_surface_swap_buffers (impl->surface, next_buffer_arrived, impl);
+  _gdk_frame_clock_freeze (clock);
+}
+
 static void
 gdk_mir_window_process_updates_recurse (GdkWindow      *window,
                                         cairo_region_t *region)
@@ -1605,6 +1690,8 @@ gdk_mir_window_process_updates_recurse (GdkWindow      *window,
 
   /* Wait for any new surface to arrive */
   wait_for_any_pending_cairo_surface (window);
+
+  _gdk_window_process_updates_recurse (window, region);
 
   /* Copy from pending buffer to new backbuffer and flip
    * the buffers on the server side */
@@ -1635,10 +1722,6 @@ gdk_mir_window_process_updates_recurse (GdkWindow      *window,
   cairo_surface_finish (impl->graphics_region_surface);
   cairo_surface_destroy (impl->graphics_region_surface);
   impl->graphics_region_surface = NULL;
-
-  mir_surface_swap_buffers (impl->surface, next_buffer_arrived, impl);
-
-  _gdk_window_process_updates_recurse (window, region);
 }
 
 static void
