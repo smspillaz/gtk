@@ -31,6 +31,7 @@
 #include "gdkinternals.h"
 #include "gdkdeviceprivate.h"
 #include "gdkframeclockprivate.h"
+#include "gdkmireventlistener.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -113,9 +114,8 @@ struct _GdkWindowImplMir
   GdkWindow *transient_for;
   GdkWindowTypeHint hint;
 
-  /* Async queue for the next graphics_region_surface
-   * as allocated by next_buffer_available */
-  GAsyncQueue *graphics_region_surface_queue;
+  GdkMirEventListener *event_listener;
+  GdkMirEventListener *surface_listener;
 
   /* The surface which is being "drawn to" to. This
    * will be set to NULL in case we end up waiting
@@ -146,6 +146,7 @@ struct _GdkWindowImplMir
   GdkDevice *grab_device;
 
   gint64 pending_frame_counter;
+  gboolean frame_ready;
 };
 
 struct _GdkWindowImplMirClass
@@ -161,6 +162,12 @@ on_frame_clock_before_paint (GdkFrameClock *clock,
 static void
 on_frame_clock_after_paint (GdkFrameClock *clock,
                             GdkWindow     *window);
+
+static void
+frame_arrived_in_main_loop (GdkMirEventListener *listener,
+                            gpointer            queue_data,
+                            GDestroyNotify      queue_data_destroy,
+                            gpointer            user_data);
 
 static void
 _gdk_window_impl_mir_init (GdkWindowImplMir *impl)
@@ -249,28 +256,6 @@ get_default_title (void)
   return title;
 }
 
-static void
-post_event_to_main_loop_for_further_processing (GdkDisplay *display,
-                                                GdkEvent   *event)
-{
-  GdkMirDisplay *mir_display = GDK_MIR_DISPLAY (display);
-
-  g_async_queue_push (mir_display->event_queue,
-                      (gpointer) event);
-  if (write (mir_display->wakeup_pipe[1],
-             (const void *) "1",
-             1) < 0)
-    {
-      switch (errno)
-        {
-        case EWOULDBLOCK:
-          break;
-        default:
-          g_critical (strerror (errno));
-        }
-    }
-}
-
 /* There is no guaruntee as to which thread this will be
  * called in, and as such should only touch:
  * - graphics_region
@@ -294,33 +279,20 @@ next_buffer_arrived (MirSurface *surface,
                                          graphics_region.height,
                                          graphics_region.stride);
 
-  GdkEvent *event = gdk_event_new (GDK_EXPOSE);
-  event->expose.window = g_object_ref (impl->wrapper);
-  event->expose.send_event = FALSE;
-  event->expose.count = 0;
-
-  cairo_rectangle_int_t area =
-  {
-    0,
-    0,
-    impl->wrapper->x,
-    impl->wrapper->y
-  };
-
-  event->expose.area = area;
-  event->expose.region = cairo_region_create_rectangle (&event->expose.area);
-
-  post_event_to_main_loop_for_further_processing (gdk_window_get_display (impl->wrapper),
-                                                  event);
-
-  g_async_queue_push (impl->graphics_region_surface_queue,
-                      next_graphics_region_surface);
+  gdk_mir_event_listener_push (impl->surface_listener,
+                               next_graphics_region_surface);
 }
 
 static void
 cairo_surface_destroy_notify_func (gpointer surface)
 {
   cairo_surface_destroy ((cairo_surface_t *) surface);
+}
+
+static void
+free_gdk_event_for_queue (gpointer event)
+{
+  gdk_event_free ((GdkEvent *) event);
 }
 
 void
@@ -373,12 +345,27 @@ _gdk_mir_display_create_window_impl (GdkDisplay    *display,
   if (attributes_mask & GDK_WA_TYPE_HINT)
     gdk_window_set_type_hint (window, attributes->type_hint);
 
-  impl->graphics_region_surface_queue =
-    g_async_queue_new_full (cairo_surface_destroy_notify_func);
+  impl->surface_listener =
+      gdk_mir_event_listener_new (cairo_surface_destroy_notify_func,
+                                  display,
+                                  _gdk_mir_display_register_event_stream_fd,
+                                  _gdk_mir_display_unregister_event_stream_fd,
+                                  frame_arrived_in_main_loop,
+                                  window,
+                                  NULL);
+  impl->event_listener =
+      gdk_mir_event_listener_new (free_gdk_event_for_queue,
+                                  display,
+                                  _gdk_mir_display_register_event_stream_fd,
+                                  _gdk_mir_display_unregister_event_stream_fd,
+                                  _gdk_mir_display_dispatch_event_in_main_thread,
+                                  display,
+                                  NULL);
   impl->cairo_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
                                                     window->width,
                                                     window->height);
   impl->pending_frame_counter = 0;
+  impl->frame_ready = FALSE;
 
   /* Set up frame-clock */
   frame_clock = gdk_window_get_frame_clock (window);
@@ -402,8 +389,6 @@ gdk_window_impl_mir_finalize (GObject *object)
       g_object_unref (impl->cursor);
     if (impl->graphics_region_surface)
       cairo_surface_destroy (impl->graphics_region_surface);
-    if (impl->graphics_region_surface_queue)
-      g_async_queue_unref (impl->graphics_region_surface_queue);
     if (impl->surface) 
       mir_surface_release_sync (impl->surface);
 
@@ -459,18 +444,17 @@ _gdk_mir_window_generate_focus_event (GdkWindow *window,
   GdkEvent *focus_change_event = NULL;
   if (last && last != window)
     {
+      GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
       focus_change_event = gdk_event_new (GDK_FOCUS_CHANGE);
       populate_focus_change_event (focus_change_event,
                                    last,
                                    device,
                                    FALSE);
-      post_event_to_main_loop_for_further_processing (gdk_device_get_display (device),
-                                                      focus_change_event);
+      gdk_mir_event_listener_push (impl->event_listener, focus_change_event);
 
       focus_change_event = gdk_event_new (GDK_FOCUS_CHANGE);
       populate_focus_change_event (focus_change_event, window, device, TRUE);
-      post_event_to_main_loop_for_further_processing (gdk_device_get_display (device),
-                                                      focus_change_event);
+      gdk_mir_event_listener_push (impl->event_listener, focus_change_event);
     }
 }
 
@@ -489,7 +473,7 @@ populate_crossing_event (GdkEvent             *event,
   event->crossing.mode = GDK_CROSSING_NORMAL;
   event->crossing.detail = GDK_NOTIFY_ANCESTOR;
   event->crossing.focus = TRUE;
-  event->crossing.state = 0;
+  event->crossing.state = _gdk_mir_mouse_gdk_button_state (pointer);
 }
 
 static void
@@ -504,8 +488,9 @@ surface_handle_hover_enter (MirSurface           *surface,
   g_return_if_fail (window != NULL);
 
   GdkEvent *event = gdk_event_new (GDK_ENTER_NOTIFY);
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   populate_crossing_event (event, me, window, pointer);
-  post_event_to_main_loop_for_further_processing (display, event);
+  gdk_mir_event_listener_push (impl->event_listener, event);
 }
 
 static void
@@ -520,8 +505,9 @@ surface_handle_hover_leave (MirSurface           *surface,
   g_return_if_fail (window != NULL);
 
   GdkEvent *event = gdk_event_new (GDK_LEAVE_NOTIFY);
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   populate_crossing_event (event, me, window, pointer);
-  post_event_to_main_loop_for_further_processing (display, event);
+  gdk_mir_event_listener_push (impl->event_listener, event);
 }
 
 static void
@@ -537,7 +523,7 @@ populate_motion_event (GdkEvent             *event,
   event->motion.x = me->pointer_coordinates[0].x;
   event->motion.y = me->pointer_coordinates[0].y;
   event->motion.axes = NULL;
-  event->motion.state = 0;
+  event->motion.state = _gdk_mir_mouse_gdk_button_state (pointer);
   event->motion.is_hint = 0;
   gdk_event_set_screen (event, gdk_display_get_screen (display, 0));
 }
@@ -554,8 +540,9 @@ surface_handle_motion (MirSurface           *surface,
   g_return_if_fail (window != NULL);
 
   GdkEvent *event = gdk_event_new (GDK_MOTION_NOTIFY);
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   populate_motion_event (event, me, display, window, pointer);
-  post_event_to_main_loop_for_further_processing (display, event);
+  gdk_mir_event_listener_push (impl->event_listener, event);
 }
 
 gboolean
@@ -585,6 +572,7 @@ typedef struct _PopulateButtonEventData
 {
   GdkEventType event_type;
   const MirMotionEvent *me;
+  guint gdk_button_state;
   GdkDisplay *display;
   GdkWindow  *window;
   GdkDevice  *device;
@@ -595,6 +583,7 @@ populate_and_send_button_event (guint    button_index,
                                 gpointer data)
 {
   PopulateButtonEventData *pd = (PopulateButtonEventData *) data;
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (pd->window->impl);
 
   GdkEvent *event = gdk_event_new (pd->event_type);
 
@@ -603,14 +592,31 @@ populate_and_send_button_event (guint    button_index,
   event->button.x = pd->me->pointer_coordinates[0].x;
   event->button.y = pd->me->pointer_coordinates[0].y;
   event->button.axes = NULL;
-  event->button.state = 0;
+  event->button.state = pd->gdk_button_state;
   event->button.button = button_index;
 
   gdk_event_set_screen (event, gdk_display_get_screen (pd->display, 0));
   gdk_event_set_device (event, pd->device);
 
-  post_event_to_main_loop_for_further_processing (pd->display,
-                                                  event);
+  gdk_mir_event_listener_push (impl->event_listener, event);
+}
+
+typedef void (*UpdateGdkButtonMaskFunc) (GdkDevice *device,
+                                         guint     button);
+
+typedef struct _UpdateGdkMaskData
+{
+  GdkDevice               *device;
+  UpdateGdkButtonMaskFunc func;
+} UpdateGdkMaskData;
+
+static void
+update_gdk_mask_for_button (guint    button_index,
+                            gpointer data)
+{
+  UpdateGdkMaskData *update_data = (UpdateGdkMaskData *) data;
+
+  update_data->func (update_data->device, button_index);
 }
 
 static void
@@ -633,10 +639,21 @@ surface_handle_button_down (MirSurface           *surface,
                                            &gained_buttons,
                                            &lost_buttons);
 
+  UpdateGdkMaskData update_data =
+  {
+    pointer,
+    _gdk_mir_mouse_track_gained_gdk_button
+  };
+
+  mir_button_mask_iterate_buttons (gained_buttons,
+                                   update_gdk_mask_for_button,
+                                   &update_data);
+
   PopulateButtonEventData data =
   {
     GDK_BUTTON_PRESS,
     me,
+    _gdk_mir_mouse_gdk_button_state (pointer),
     display,
     window,
     pointer
@@ -667,10 +684,21 @@ surface_handle_button_up (MirSurface           *surface,
                                            &gained_buttons,
                                            &lost_buttons);
 
+  UpdateGdkMaskData update_data =
+  {
+    pointer,
+    _gdk_mir_mouse_track_lost_gdk_button
+  };
+
+  mir_button_mask_iterate_buttons (lost_buttons,
+                                   update_gdk_mask_for_button,
+                                   &update_data);
+
   PopulateButtonEventData data =
   {
     GDK_BUTTON_RELEASE,
     me,
+    _gdk_mir_mouse_gdk_button_state (pointer),
     display,
     window,
     pointer
@@ -703,14 +731,12 @@ surface_handle_motion_event (MirSurface           *surface,
       surface_handle_button_up (surface, me, display, window, pointer);
       break;
     case mir_motion_action_hover_enter:
-      /* Currently Mir is generating leave events on button down
-       * which confuses GDK, so crossing events are disabled for now
-       * surface_handle_hover_enter (surface, me, display, window, pointer); */
+      surface_handle_hover_enter (surface, me, display, window, pointer);
       break;
     case mir_motion_action_hover_exit:
       /* Currently Mir is generating leave events on button down
        * which confuses GDK, so crossing events are disabled for now
-       * surface_handle_hover_leave (surface, me, display, window, pointer); */
+       surface_handle_hover_leave (surface, me, display, window, pointer); */
       break;
     case mir_motion_action_hover_move:
     case mir_motion_action_move:
@@ -747,9 +773,9 @@ surface_handle_key_down_event (MirSurface        *surface,
   g_return_if_fail (window != NULL);
 
   GdkEvent *event = gdk_event_new (GDK_KEY_PRESS);
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   populate_key_event (event, ke, device, window);
-  post_event_to_main_loop_for_further_processing (display,
-                                                  event);
+  gdk_mir_event_listener_push (impl->event_listener, event);
 }
 
 static void
@@ -764,9 +790,9 @@ surface_handle_key_up_event (MirSurface        *surface,
   g_return_if_fail (window != NULL);
 
   GdkEvent *event = gdk_event_new (GDK_KEY_RELEASE);
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   populate_key_event (event, ke, device, window);
-  post_event_to_main_loop_for_further_processing (display,
-                                                  event);
+  gdk_mir_event_listener_push (impl->event_listener, event);
 }
 
 static void
@@ -835,6 +861,7 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
     GdkDisplay *display = NULL;
     GdkMirDisplay *display_mir = NULL;
     GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR(window->impl);
+    GdkFrameClock *frame_clock = NULL;
     GdkEvent *event;
     MirEventDelegate delegate =                                                 
     {                                                                           
@@ -842,8 +869,8 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
         window
     };
 
-    display = gdk_window_get_display(window);
-    display_mir = GDK_MIR_DISPLAY(display);
+    display = gdk_window_get_display (window);
+    display_mir = GDK_MIR_DISPLAY (display);
 
     if (impl->user_time != 0 &&
         display_mir->user_time != 0) 
@@ -862,8 +889,10 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
 
     impl->surface = mir_connection_create_surface_sync (display_mir->mir_connection,
                                                         &request_params);
-    if (mir_surface_is_valid (impl->surface))
-      mir_surface_set_event_handler (impl->surface, &delegate);
+
+    g_return_if_fail (mir_surface_is_valid (impl->surface));
+
+    mir_surface_set_event_handler (impl->surface, &delegate);
 
     gdk_window_set_type_hint (window, impl->hint);  
 
@@ -871,8 +900,12 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
     event = _gdk_make_event (window, GDK_VISIBILITY_NOTIFY, NULL, FALSE);
     event->visibility.state = GDK_VISIBILITY_UNOBSCURED;
 
+    /* Freeze the frame clock and wait for our first exposure */
+    frame_clock = gdk_window_get_frame_clock (window);
+    _gdk_frame_clock_freeze (frame_clock);
+
     /* Call the next surface handler from within the main thread so that we
-     * will immediately have a cairo surfaec to render on */
+     * will immediately have a cairo surface to render on */
     next_buffer_arrived (impl->surface, impl);
 }
 
@@ -1572,17 +1605,6 @@ gdk_mir_window_destroy_notify (GdkWindow *window)
   g_object_unref (window);
 }
 
-static void
-wait_for_any_pending_cairo_surface (GdkWindow *window)
-{
-  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
-
-  impl->graphics_region_surface =
-    g_async_queue_pop (impl->graphics_region_surface_queue);
-
-  g_assert (impl->graphics_region_surface != NULL);
-}
-
 static gboolean
 gdk_mir_window_begin_paint_region (GdkWindow       *window,
                                    const cairo_region_t *region)
@@ -1613,11 +1635,17 @@ gdk_mir_window_create_similar_image_surface (GdkWindow *     window,
 }
 
 void
-_gdk_mir_window_frame_arrived_in_main_loop (GdkWindow *window)
+frame_arrived_in_main_loop (GdkMirEventListener *listener,
+                            gpointer            queue_data,
+                            GDestroyNotify      queue_data_destroy,
+                            gpointer            user_data)
 {
+  GdkWindow *window = (GdkWindow *) user_data;
   GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   GdkFrameClock *clock = gdk_window_get_frame_clock (window);
   GdkFrameTimings *timings;
+
+  impl->graphics_region_surface = (cairo_surface_t *) queue_data;
 
   /* Thaw frame clock. We are now ready to process the next frame */
   _gdk_frame_clock_thaw (clock);
@@ -1626,6 +1654,7 @@ _gdk_mir_window_frame_arrived_in_main_loop (GdkWindow *window)
    * the start of a new frame */
   timings = gdk_frame_clock_get_timings (clock, impl->pending_frame_counter);
   impl->pending_frame_counter = 0;
+  impl->frame_ready = FALSE;
 
   if (timings == NULL)
     return;
@@ -1661,22 +1690,6 @@ on_frame_clock_before_paint (GdkFrameClock *clock,
 }
 
 static void
-on_frame_clock_after_paint (GdkFrameClock *clock,
-                            GdkWindow     *window)
-{
-  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
-
-  /* Determine the ID of the pending frame so that we can set timings
-   * in _gdk_mir_window_frame_arrived_in_main_loop */
-  impl->pending_frame_counter = gdk_frame_clock_get_frame_counter (clock);
-
-  /* Frame is now complete - swap buffers and wait for the next buffer
-   * to arrive */
-  mir_surface_swap_buffers (impl->surface, next_buffer_arrived, impl);
-  _gdk_frame_clock_freeze (clock);
-}
-
-static void
 gdk_mir_window_process_updates_recurse (GdkWindow      *window,
                                         cairo_region_t *region)
 {
@@ -1687,9 +1700,6 @@ gdk_mir_window_process_updates_recurse (GdkWindow      *window,
 
   /* Ensure that the window is mapped */
   gdk_mir_window_map (window);
-
-  /* Wait for any new surface to arrive */
-  wait_for_any_pending_cairo_surface (window);
 
   _gdk_window_process_updates_recurse (window, region);
 
@@ -1722,6 +1732,30 @@ gdk_mir_window_process_updates_recurse (GdkWindow      *window,
   cairo_surface_finish (impl->graphics_region_surface);
   cairo_surface_destroy (impl->graphics_region_surface);
   impl->graphics_region_surface = NULL;
+  impl->frame_ready = TRUE;
+}
+
+static void
+on_frame_clock_after_paint (GdkFrameClock *clock,
+                            GdkWindow     *window)
+{
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
+
+  /* We haven't updated the frame yet */
+  if (!impl->frame_ready)
+    return;
+
+  /* Determine the ID of the pending frame so that we can set timings
+   * in _gdk_mir_window_frame_arrived_in_main_loop */
+  impl->pending_frame_counter = gdk_frame_clock_get_frame_counter (clock);
+
+  /* Frame is now complete - swap buffers and wait for the next buffer
+   * to arrive */
+  gdk_mir_event_listener_listen_to_event_stream (impl->surface_listener,
+                                                 mir_surface_swap_buffers (impl->surface,
+                                                                           next_buffer_arrived,
+                                                                           impl));
+  _gdk_frame_clock_freeze (clock);
 }
 
 static void

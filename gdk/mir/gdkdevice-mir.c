@@ -48,6 +48,9 @@ struct _GdkMirDeviceData
   /* Bitwise OR mask of the buttons down on this mouse */
   MirMotionButton button_state;
 
+  /* GDK Button State "modifier mask" */
+  guint gdk_button_state;
+
   /* Pointer co-ordinates */
   gdouble         surface_pointer_x;
   gdouble         surface_pointer_y;
@@ -362,6 +365,49 @@ _gdk_mir_mouse_update_from_crossing_event (GdkDevice            *device,
   mir_device_data->surface_pointer_x = event->pointer_coordinates[0].x;
   mir_device_data->surface_pointer_y = event->pointer_coordinates[0].y;
   mir_device_data->hovered_window = window;
+}
+
+static inline guint
+button_to_gdk_modifier_mask (guint button)
+{
+  return 1 << (8 + button - 1);
+}
+
+void
+_gdk_mir_mouse_track_gained_gdk_button (GdkDevice *device,
+                                        guint     button)
+{
+  g_return_if_fail (GDK_IS_MIR_DEVICE (device));
+
+  GdkMirDevice *mir_device = GDK_MIR_DEVICE (device);
+  GdkMirDeviceData *mir_device_data = mir_device->device;
+
+  mir_device_data->gdk_button_state |=
+    button_to_gdk_modifier_mask (button);
+}
+
+void
+_gdk_mir_mouse_track_lost_gdk_button (GdkDevice *device,
+                                      guint     button)
+{
+  g_return_if_fail (GDK_IS_MIR_DEVICE (device));
+
+  GdkMirDevice *mir_device = GDK_MIR_DEVICE (device);
+  GdkMirDeviceData *mir_device_data = mir_device->device;
+
+  mir_device_data->gdk_button_state &=
+    ~(button_to_gdk_modifier_mask (button));
+}
+
+guint
+_gdk_mir_mouse_gdk_button_state (GdkDevice *device)
+{
+  g_return_if_fail (GDK_IS_MIR_DEVICE (device));
+
+  GdkMirDevice *mir_device = GDK_MIR_DEVICE (device);
+  GdkMirDeviceData *mir_device_data = mir_device->device;
+
+  return mir_device_data->gdk_button_state;
 }
 
 GdkWindow *

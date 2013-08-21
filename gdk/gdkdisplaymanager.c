@@ -60,6 +60,10 @@
 #include "wayland/gdkprivate-wayland.h"
 #endif
 
+#ifdef GDK_WINDOWING_MIR
+#include "mir/gdkprivate-mir.h"
+#endif
+
 /**
  * SECTION:gdkdisplaymanager
  * @Short_description: Maintains a list of all open GdkDisplays
@@ -269,6 +273,9 @@ static GdkBackend gdk_backends[] = {
 #endif
 #ifdef GDK_WINDOWING_WAYLAND
   { "wayland",  _gdk_wayland_display_open },
+#endif
+#ifdef GDK_WINDOWING_MIR
+  { "mir",  _gdk_mir_display_open },
 #endif
 #ifdef GDK_WINDOWING_X11
   { "x11",      _gdk_x11_display_open },

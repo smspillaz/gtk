@@ -20,18 +20,17 @@
 #include "gdkinternals.h"
 #include "gdkprivate-mir.h"
 #include "gdkmir.h"
+#include "gdkmireventlistener.h"
 
 #include <errno.h>
 #include <string.h>
 
 typedef struct _GdkMirEventSource {
   GSource source;
-  GPollFD pfd;
   uint32_t mask;
   GdkDisplay *display;
+  GHashTable *fd_tags;
 } GdkMirEventSource;
-
-static GList *event_sources = NULL;
 
 static ssize_t
 read_all_data_from_pipe_into_null (int fd)
@@ -99,12 +98,43 @@ gdk_event_source_prepare(GSource *base, gint *timeout)
   return FALSE;
 }
 
+static void
+check_event_listeners_for_any_pending_data (gpointer key,
+                                            gpointer value,
+                                            gpointer user_data)
+{
+  gboolean *ready = user_data;
+
+  /* We don't return immediately if ready is TRUE here as
+   * we should still drain all of the pending listeners'
+   * wakeup pipes as we will be dispatching any pending
+   * events on them anyways */
+
+  *ready |= pipe_had_data (GPOINTER_TO_INT (key));
+}
+
 static gboolean
 gdk_event_source_check (GSource *base)
 {
   GdkMirEventSource *source = (GdkMirEventSource *) base;
+  GdkMirDisplay *mir_display = GDK_MIR_DISPLAY (source->display);
 
-  return pipe_had_data (GDK_MIR_DISPLAY (source->display)->wakeup_pipe[0]);
+  gboolean ready = FALSE;
+
+  g_hash_table_foreach (mir_display->event_listeners,
+                        check_event_listeners_for_any_pending_data,
+                        &ready);
+
+  return ready;
+}
+
+void
+dispatch_event_listeners (gpointer key,
+			  gpointer value,
+			  gpointer user_data)
+{
+  GdkMirEventListener *listener = (GdkMirEventListener *) value;
+  gdk_mir_event_listener_dispatch_pending (listener);
 }
 
 static gboolean
@@ -113,12 +143,19 @@ gdk_event_source_dispatch(GSource *base,
 			  gpointer data)
 {
   GdkMirEventSource *source = (GdkMirEventSource *) base;
-  GdkDisplay *display = source->display;
+  GdkMirDisplay *mir_display = GDK_MIR_DISPLAY (source->display);
   GdkEvent *event;
 
+  /* Dispatch internal event listeners which may cause
+   * events to be queued (but not emitted) */
+  g_hash_table_foreach (mir_display->event_listeners,
+                        dispatch_event_listeners,
+                        NULL);
+
+  /* Dispatch queued events */
   gdk_threads_enter ();
 
-  event = gdk_display_get_event (display);
+  event = gdk_display_get_event (source->display);
 
   if (event)
     {
@@ -135,7 +172,6 @@ gdk_event_source_dispatch(GSource *base,
 static void
 gdk_event_source_finalize (GSource *source)
 {
-  event_sources = g_list_remove (event_sources, source);
 }
 
 static GSourceFuncs mir_glib_source_funcs = {
@@ -148,29 +184,74 @@ static GSourceFuncs mir_glib_source_funcs = {
 GSource *
 _gdk_mir_display_event_source_new (GdkDisplay *display)
 {
-  GSource *source;
-  GdkMirEventSource *mir_source;
-  GdkMirDisplay *display_mir;
-  char *name;
+  GSource *source = g_source_new (&mir_glib_source_funcs,
+                                  sizeof (GdkMirEventSource));
+  GdkMirEventSource *mir_source = (GdkMirEventSource *) source;
+  char *name = g_strdup_printf ("GDK Mir Event source (%s)", "display name");;
 
-  source = g_source_new (&mir_glib_source_funcs,
-			 sizeof (GdkMirEventSource));
-  name = g_strdup_printf ("GDK Mir Event source (%s)", "display name");
   g_source_set_name (source, name);
   g_free (name);
-  mir_source = (GdkMirEventSource *) source;
 
-  display_mir = GDK_MIR_DISPLAY (display);
   mir_source->display = display;
-  mir_source->pfd.fd = display_mir->wakeup_pipe[0];
-  mir_source->pfd.events = G_IO_IN | G_IO_ERR | G_IO_HUP;
-  g_source_add_poll(source, &mir_source->pfd);
+  mir_source->fd_tags = g_hash_table_new (g_direct_hash, g_direct_equal);
 
   g_source_set_priority (source, GDK_PRIORITY_EVENTS);
   g_source_set_can_recurse (source, TRUE);
   g_source_attach (source, NULL);
 
-  event_sources = g_list_prepend (event_sources, source);
-
   return source;
+}
+
+void
+_gdk_mir_display_register_event_stream_fd (gpointer            data,
+					   GdkMirEventListener *listener,
+					   int                 fd)
+{
+  GdkDisplay *display = (GdkDisplay *) data;
+  GdkMirDisplay *mir_display = GDK_MIR_DISPLAY (display);
+  GdkMirEventSource *mir_source = (GdkMirEventSource *) mir_display->event_source;
+
+  g_return_if_fail (mir_display->event_source);
+
+  g_hash_table_insert (mir_display->event_listeners,
+                       GINT_TO_POINTER (fd),
+                       listener);
+
+
+  gpointer tag = g_source_add_unix_fd (mir_display->event_source,
+                                       fd,
+                                       G_IO_IN | G_IO_ERR | G_IO_HUP);
+
+  g_hash_table_insert (mir_source->fd_tags, GINT_TO_POINTER (fd), tag);
+}
+
+void
+_gdk_mir_display_unregister_event_stream_fd (gpointer            data,
+					     GdkMirEventListener *listener,
+					     int                 fd)
+{
+  GdkDisplay *display = (GdkDisplay *) data;
+  GdkMirDisplay *mir_display = GDK_MIR_DISPLAY (display);
+  GdkMirEventSource *mir_source = (GdkMirEventSource *) mir_display->event_source;
+
+  g_hash_table_remove (mir_display->event_listeners,
+                       GINT_TO_POINTER (fd));
+
+  gpointer tag = g_hash_table_lookup (mir_source->fd_tags,
+                                      GINT_TO_POINTER (fd));
+  g_source_remove_unix_fd (mir_display->event_source,
+                           tag);
+  g_hash_table_remove (mir_source->fd_tags, GINT_TO_POINTER (fd));
+}
+
+void
+_gdk_mir_display_dispatch_event_in_main_thread (GdkMirEventListener *listener,
+						gpointer            queue_data,
+						GDestroyNotify      queue_data_destroy,
+						gpointer            user_data)
+{
+  GdkDisplay *display = (GdkDisplay *) user_data;
+  GdkMirDisplay *mir_display = GDK_MIR_DISPLAY (display);
+
+  g_queue_push_head (mir_display->event_queue, queue_data);
 }

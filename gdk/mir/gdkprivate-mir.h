@@ -46,7 +46,6 @@ void _gdk_mir_window_set_device_grabbed (GdkWindow *window,
 void _gdk_mir_window_generate_focus_event (GdkWindow *window,
 					   GdkWindow *last,
 					   GdkDevice *device);
-void _gdk_mir_window_frame_arrived_in_main_loop (GdkWindow *window);
 
 GdkKeymap *_gdk_mir_keymap_new (void);
 GdkCursor *_gdk_mir_display_get_cursor_for_type (GdkDisplay    *display,
@@ -120,6 +119,19 @@ GdkKeymap *_gdk_mir_device_get_keymap (GdkDevice *device);
 
 GSource *_gdk_mir_display_event_source_new (GdkDisplay *display);
 
+typedef struct _GdkMirEventListener GdkMirEventListener;
+
+void _gdk_mir_display_register_event_stream_fd (gpointer            data,
+						GdkMirEventListener *listener,
+						int                 fd);
+void _gdk_mir_display_unregister_event_stream_fd (gpointer            data,
+						  GdkMirEventListener *listener,
+						  int                 fd);
+void _gdk_mir_display_dispatch_event_in_main_thread (GdkMirEventListener *listener,
+						     gpointer            queue_data,
+						     GDestroyNotify      queue_data_destroy,
+						     gpointer            user_data);
+
 GdkAppLaunchContext *_gdk_mir_display_get_app_launch_context (GdkDisplay *display);
 
 GdkDisplay *_gdk_mir_display_open (const gchar *display_name);
@@ -145,6 +157,14 @@ void _gdk_mir_mouse_update_from_motion_event (GdkDevice            *device,
 void _gdk_mir_mouse_update_from_crossing_event (GdkDevice            *device,
 						GdkWindow            *window,
 						const MirMotionEvent *event);
+
+/* Gets the button state as the gdk button state, for use
+ * in setting event->motion.state */
+void _gdk_mir_mouse_track_gained_gdk_button (GdkDevice *device,
+                                             guint     button);
+void _gdk_mir_mouse_track_lost_gdk_button (GdkDevice *device,
+                                           guint     button);
+guint _gdk_mir_mouse_gdk_button_state (GdkDevice *device);
 
 GdkWindow * _gdk_mir_device_get_hovered_window (GdkDevice *device);
 GdkDevice * _gdk_mir_device_manager_get_core_keyboard (GdkDeviceManager *device);

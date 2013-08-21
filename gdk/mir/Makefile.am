@@ -30,7 +30,8 @@ libgdk_mir_la_SOURCES =				\
 	gdkscreen-mir.c				\
 	gdkselection-mir.c			\
 	gdkwindow-mir.c				\
-	gdkeventsource.c
+        gdkeventsource.c			\
+        gdkmireventlistener.c                   \
 	gdkmir.h				\
 	gdkprivate-mir.h
 

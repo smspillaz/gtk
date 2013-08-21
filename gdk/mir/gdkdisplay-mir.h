@@ -63,23 +63,9 @@ struct _GdkMirDisplay
   MirConnection *mir_connection;
   MirDisplayInfo mir_display_info;
 
-  GSource *event_source;
-
-  /* Event queue - each window pushes its own events into the
-   * queue in their own monitor threads created by mirclient.
-   * event_queue_monitor is responsible for watching the
-   * event_queue for incoming events and setting
-   * first_pending_event as well as writing data to
-   * the wakeup_pipe as a result.
-   *
-   * event_queue_monitor_messages is responsible for
-   * telling the event_queue_monitor to start
-   * watching the event queue again as we've entered
-   * poll() or to stop monitoring alltogether as we've quit
-   */
-  GAsyncQueue *event_queue;
-  GThread     *event_queue_monitor;
-  int         wakeup_pipe[2];
+  GSource    *event_source;
+  GHashTable *event_listeners;
+  GQueue     *event_queue;
 };
 
 struct _GdkMirDisplayClass
