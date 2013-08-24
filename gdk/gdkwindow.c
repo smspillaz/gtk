@@ -3586,7 +3586,7 @@ gdk_window_process_all_updates (void)
       GdkWindow *window = tmp_list->data;
 
       if (!GDK_WINDOW_DESTROYED (window))
-	{
+        {
 	  if (window->update_freeze_count ||
 	      gdk_window_is_toplevel_frozen (window))
 	    gdk_window_add_update_window (window);
@@ -3813,8 +3813,13 @@ static void
 impl_window_add_update_area (GdkWindow *impl_window,
 			     cairo_region_t *region)
 {
+  GdkWindowImplClass *impl = GDK_WINDOW_IMPL_GET_CLASS (impl_window->impl);
+
+  if (impl->adjust_update_region)
+    impl->adjust_update_region (impl_window, region);
+
   if (impl_window->update_area)
-    cairo_region_union (impl_window->update_area, region);
+      cairo_region_union (impl_window->update_area, region);
   else
     {
       gdk_window_add_update_window (impl_window);
@@ -4179,7 +4184,7 @@ gdk_window_thaw_updates (GdkWindow *window)
   g_return_if_fail (impl_window->update_freeze_count > 0);
 
   if (--impl_window->update_freeze_count == 0)
-    gdk_window_schedule_update (GDK_WINDOW (impl_window));
+      gdk_window_schedule_update (GDK_WINDOW (impl_window));
 }
 
 /**

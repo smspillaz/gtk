@@ -292,6 +292,8 @@ struct _GdkWindowImplClass
                                            GdkAtom         property);
 
   gint         (* get_scale_factor)       (GdkWindow      *window);
+  void         (*adjust_update_region)    (GdkWindow      *window,
+                                           cairo_region_t *region);
 };
 
 /* Interface Functions */

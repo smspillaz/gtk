@@ -421,8 +421,8 @@ gdk_mir_display_pop_error_trap (GdkDisplay *display,
   return 0;
 }
 
-static void
-gdk_mir_display_deliver_event (GdkDisplay *display, GdkEvent *event)
+void
+_gdk_mir_display_deliver_event (GdkDisplay *display, GdkEvent *event)
 {
   GList *node;
 
@@ -461,7 +461,7 @@ synthesize_leave_event_from_enter_event (GdkDisplay *display,
 
       /* Queue the synthetic leave event */
       gdk_mir_display_process_event_internal (display, leave_event);
-      gdk_mir_display_deliver_event (display, leave_event);
+      _gdk_mir_display_deliver_event (display, leave_event);
     }
 }
 
@@ -526,7 +526,7 @@ gdk_mir_display_queue_events (GdkDisplay *display)
       /* _gdk_windowing_got_event may free and unlink the event, so we
        * need to do any state adjustments here first */
       gdk_mir_display_process_event_internal (display, event);
-      gdk_mir_display_deliver_event (display, event);
+      _gdk_mir_display_deliver_event (display, event);
 
       event = (GdkEvent *) g_queue_pop_tail (display_mir->event_queue);
     }

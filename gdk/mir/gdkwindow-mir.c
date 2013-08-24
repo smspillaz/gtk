@@ -122,10 +122,14 @@ struct _GdkWindowImplMir
    * on a new buffer. This may be updated in another thread*/
   cairo_surface_t *graphics_region_surface;
 
-  /* The "back buffer" surface. This is persistent and
-   * will be flipped to graphics_region_surface on
-   * gdk_window_process updates */
-  cairo_surface_t *cairo_surface;
+  /* Frame update areas
+   * This implements a kind of backbuffer age where we record
+   * the drawn areas on each frame so that we can potentially
+   * use them later in order to update for older frames */
+  GQueue *previous_frames;
+
+  /* Current frame "damage" recording */
+  cairo_region_t *current_frame_update_area;
 
   uint32_t resize_edges;
 
@@ -147,6 +151,7 @@ struct _GdkWindowImplMir
 
   gint64 pending_frame_counter;
   gboolean frame_ready;
+  gboolean awaiting_update;
 };
 
 struct _GdkWindowImplMirClass
@@ -162,6 +167,10 @@ on_frame_clock_before_paint (GdkFrameClock *clock,
 static void
 on_frame_clock_after_paint (GdkFrameClock *clock,
                             GdkWindow     *window);
+static void
+on_frame_clock_request_phase (GdkFrameClock      *clock,
+                              GdkFrameClockPhase request_phase,
+                              GdkWindow          *window);
 
 static void
 frame_arrived_in_main_loop (GdkMirEventListener *listener,
@@ -256,6 +265,23 @@ get_default_title (void)
   return title;
 }
 
+static cairo_surface_t *
+fetch_graphics_region_and_create_surface (MirSurface *surface)
+{
+  MirGraphicsRegion graphics_region;
+
+  /* Update the graphics region and cairo surface */
+  mir_surface_get_graphics_region (surface, &graphics_region);
+  cairo_surface_t *graphics_region_surface =
+    cairo_image_surface_create_for_data ((guchar *) graphics_region.vaddr,
+                                         CAIRO_FORMAT_ARGB32,
+                                         graphics_region.width,
+                                         graphics_region.height,
+                                         graphics_region.stride);
+
+  return graphics_region_surface;
+}
+
 /* There is no guaruntee as to which thread this will be
  * called in, and as such should only touch:
  * - graphics_region
@@ -268,16 +294,8 @@ next_buffer_arrived (MirSurface *surface,
 {
   GdkWindowImplMir *impl = (GdkWindowImplMir *) data;
 
-  MirGraphicsRegion graphics_region;
-
-  /* Update the graphics region and cairo surface */
-  mir_surface_get_graphics_region (surface, &graphics_region);
   cairo_surface_t *next_graphics_region_surface =
-    cairo_image_surface_create_for_data ((guchar *) graphics_region.vaddr,
-                                         CAIRO_FORMAT_ARGB32,
-                                         graphics_region.width,
-                                         graphics_region.height,
-                                         graphics_region.stride);
+    fetch_graphics_region_and_create_surface (surface);
 
   gdk_mir_event_listener_push (impl->surface_listener,
                                next_graphics_region_surface);
@@ -287,6 +305,12 @@ static void
 cairo_surface_destroy_notify_func (gpointer surface)
 {
   cairo_surface_destroy ((cairo_surface_t *) surface);
+}
+
+static void
+cairo_region_destroy_notify_func (gpointer region)
+{
+  cairo_region_destroy ((cairo_region_t *) region);
 }
 
 static void
@@ -361,11 +385,9 @@ _gdk_mir_display_create_window_impl (GdkDisplay    *display,
                                   _gdk_mir_display_dispatch_event_in_main_thread,
                                   display,
                                   NULL);
-  impl->cairo_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                                    window->width,
-                                                    window->height);
   impl->pending_frame_counter = 0;
   impl->frame_ready = FALSE;
+  impl->awaiting_update = FALSE;
 
   /* Set up frame-clock */
   frame_clock = gdk_window_get_frame_clock (window);
@@ -374,6 +396,8 @@ _gdk_mir_display_create_window_impl (GdkDisplay    *display,
                     G_CALLBACK (on_frame_clock_before_paint), window);
   g_signal_connect (frame_clock, "after-paint",
                     G_CALLBACK (on_frame_clock_after_paint), window);
+  g_signal_connect (frame_clock, "request-phase",
+                    G_CALLBACK (on_frame_clock_request_phase), window);
 }
 
 static void
@@ -391,6 +415,10 @@ gdk_window_impl_mir_finalize (GObject *object)
       cairo_surface_destroy (impl->graphics_region_surface);
     if (impl->surface) 
       mir_surface_release_sync (impl->surface);
+    if (impl->current_frame_update_area)
+      cairo_region_destroy (impl->current_frame_update_area);
+    if (impl->previous_frames)
+      g_queue_free_full (impl->previous_frames, cairo_region_destroy_notify_func);
 
     G_OBJECT_CLASS (_gdk_window_impl_mir_parent_class)->finalize (object);
 }
@@ -399,7 +427,18 @@ static void
 gdk_mir_window_configure (GdkWindow *window,
                           int width, int height, int edges)
 {
-  /* TODO: Unimplemented */
+  /* TODO: We're unable to configure windows at present in the protocol
+   * so just queue a new GDK_EVENT_CONFIGURE with the same size */
+  GdkEvent *event = gdk_event_new (GDK_CONFIGURE);
+  event->configure.window = g_object_ref (window);
+  event->configure.send_event = FALSE;
+  event->configure.width = window->width;
+  event->configure.height = window->height;
+
+  _gdk_window_update_size (window);
+
+  _gdk_mir_display_deliver_event (gdk_window_get_display (window),
+                                  event);
   return;
 }
 
@@ -542,6 +581,7 @@ surface_handle_motion (MirSurface           *surface,
   GdkEvent *event = gdk_event_new (GDK_MOTION_NOTIFY);
   GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
   populate_motion_event (event, me, display, window, pointer);
+
   gdk_mir_event_listener_push (impl->event_listener, event);
 }
 
@@ -861,7 +901,6 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
     GdkDisplay *display = NULL;
     GdkMirDisplay *display_mir = NULL;
     GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR(window->impl);
-    GdkFrameClock *frame_clock = NULL;
     GdkEvent *event;
     MirEventDelegate delegate =                                                 
     {                                                                           
@@ -900,13 +939,11 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
     event = _gdk_make_event (window, GDK_VISIBILITY_NOTIFY, NULL, FALSE);
     event->visibility.state = GDK_VISIBILITY_UNOBSCURED;
 
-    /* Freeze the frame clock and wait for our first exposure */
-    frame_clock = gdk_window_get_frame_clock (window);
-    _gdk_frame_clock_freeze (frame_clock);
-
-    /* Call the next surface handler from within the main thread so that we
-     * will immediately have a cairo surface to render on */
-    next_buffer_arrived (impl->surface, impl);
+    /* Fetch graphics region surface immediately */
+    impl->graphics_region_surface =
+      fetch_graphics_region_and_create_surface (impl->surface);
+    impl->previous_frames = g_queue_new ();
+    impl->current_frame_update_area = cairo_region_create ();
 }
 
 static void
@@ -1620,9 +1657,18 @@ gdk_mir_window_ref_cairo_surface (GdkWindow *window)
   if (GDK_WINDOW_DESTROYED (impl->wrapper))
     return NULL;
 
-  cairo_surface_reference (impl->cairo_surface);
+  if (impl->graphics_region_surface)
+    {
+      cairo_surface_reference (impl->graphics_region_surface);
 
-  return impl->cairo_surface;
+      return impl->graphics_region_surface;
+    }
+  else
+    {
+      return cairo_image_surface_create (CAIRO_FORMAT_ARGB32, window->width, window->height);
+    }
+
+  return NULL;
 }
 
 static cairo_surface_t *
@@ -1674,6 +1720,19 @@ frame_arrived_in_main_loop (GdkMirEventListener *listener,
 }
 
 static void
+on_frame_clock_request_phase (GdkFrameClock      *clock,
+                              GdkFrameClockPhase request_phase,
+                              GdkWindow          *window)
+{
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
+  if (impl->awaiting_update)
+    {
+      impl->awaiting_update = FALSE;
+      _gdk_frame_clock_thaw (clock);
+    }
+}
+
+static void
 on_frame_clock_before_paint (GdkFrameClock *clock,
                              GdkWindow     *window)
 {
@@ -1694,44 +1753,11 @@ gdk_mir_window_process_updates_recurse (GdkWindow      *window,
                                         cairo_region_t *region)
 {
   GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
-  guint i, n = cairo_region_num_rectangles (region);;
-  cairo_rectangle_int_t rect;
-  cairo_t *graphics_region_context = NULL;
-
   /* Ensure that the window is mapped */
   gdk_mir_window_map (window);
 
   _gdk_window_process_updates_recurse (window, region);
 
-  /* Copy from pending buffer to new backbuffer and flip
-   * the buffers on the server side */
-  graphics_region_context = cairo_create (impl->graphics_region_surface);
-  cairo_set_operator (graphics_region_context, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_surface (graphics_region_context,
-                            impl->cairo_surface,
-                            0.0f,
-                            0.0f);
-
-  /* TODO: Use the native buffer age to determine which
-   * areas need to be copied */
-  for (i = 0; i < n; ++i)
-    {
-      cairo_region_get_rectangle (region, i, &rect);
-    }
-
-  /* Copy from pending to back */
-  cairo_rectangle (graphics_region_context,
-                   0.0f,
-                   0.0f,
-                   window->width,
-                   window->height);
-  cairo_fill (graphics_region_context);
-
-  cairo_destroy (graphics_region_context);
-
-  cairo_surface_finish (impl->graphics_region_surface);
-  cairo_surface_destroy (impl->graphics_region_surface);
-  impl->graphics_region_surface = NULL;
   impl->frame_ready = TRUE;
 }
 
@@ -1741,9 +1767,30 @@ on_frame_clock_after_paint (GdkFrameClock *clock,
 {
   GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
 
+  if (!impl->awaiting_update)
+      _gdk_frame_clock_freeze (clock);
+
   /* We haven't updated the frame yet */
   if (!impl->frame_ready)
-    return;
+    {
+      impl->awaiting_update = TRUE;
+      return;
+    }
+
+  static volatile int debug_framenum = 0;
+
+  if (debug_framenum)
+    {
+      char *location;
+      char *home = getenv ("HOME");
+      asprintf (&location, "%s/mir-gdk-after-paint-%i.png", home, debug_framenum);
+      cairo_surface_write_to_png (impl->graphics_region_surface, location);
+      debug_framenum++;
+    }
+
+  cairo_surface_flush (impl->graphics_region_surface);
+  cairo_surface_destroy (impl->graphics_region_surface);
+  impl->graphics_region_surface = NULL;
 
   /* Determine the ID of the pending frame so that we can set timings
    * in _gdk_mir_window_frame_arrived_in_main_loop */
@@ -1755,7 +1802,10 @@ on_frame_clock_after_paint (GdkFrameClock *clock,
                                                  mir_surface_swap_buffers (impl->surface,
                                                                            next_buffer_arrived,
                                                                            impl));
-  _gdk_frame_clock_freeze (clock);
+  g_queue_push_head (impl->previous_frames, impl->current_frame_update_area);
+  if (impl->previous_frames->length > 10)
+    cairo_region_destroy (g_queue_pop_tail (impl->previous_frames));
+  impl->current_frame_update_area = cairo_region_create ();
 }
 
 static void
@@ -1815,6 +1865,48 @@ static void
 gdk_mir_window_delete_property (GdkWindow *window,
 				GdkAtom    property)
 {
+}
+
+static void
+gdk_window_impl_mir_adjust_update_region (GdkWindow      *window,
+                                          cairo_region_t *region)
+{
+  /* First record the update region as being part of this frame */
+  GdkWindowImplMir *impl = GDK_WINDOW_IMPL_MIR (window->impl);
+  cairo_region_union (impl->current_frame_update_area,
+                      region);
+
+  MirBufferPackage *surface_buffer;
+  mir_surface_get_current_buffer (impl->surface, &surface_buffer);
+
+  guint age = surface_buffer->age;
+
+  /* More than zero (all undefined) or less than our frame buffer
+   * length and we can accumulate damages */
+  if (surface_buffer->age > 0 &&
+      age < impl->previous_frames->length)
+    {
+      while (age--)
+        {
+          cairo_region_t *previous_region =
+            (cairo_region_t *) g_queue_peek_nth (impl->previous_frames,
+                                                 age);
+          cairo_region_union (region, previous_region);
+        }
+    }
+  else
+    {
+      cairo_rectangle_int_t window_rectangle =
+      {
+        0,
+        0,
+        window->width,
+        window->height
+      };
+
+      cairo_region_union_rectangle (region,
+                                    &window_rectangle);
+    }
 }
 
 static void
@@ -1906,4 +1998,6 @@ _gdk_window_impl_mir_class_init (GdkWindowImplMirClass *klass)
   impl_class->get_property = gdk_mir_window_get_property;
   impl_class->change_property = gdk_mir_window_change_property;
   impl_class->delete_property = gdk_mir_window_delete_property;
+
+  impl_class->adjust_update_region = gdk_window_impl_mir_adjust_update_region;
 }

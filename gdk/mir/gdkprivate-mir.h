@@ -131,6 +131,7 @@ void _gdk_mir_display_dispatch_event_in_main_thread (GdkMirEventListener *listen
 						     gpointer            queue_data,
 						     GDestroyNotify      queue_data_destroy,
 						     gpointer            user_data);
+void _gdk_mir_display_deliver_event (GdkDisplay *display, GdkEvent *event);
 
 GdkAppLaunchContext *_gdk_mir_display_get_app_launch_context (GdkDisplay *display);
 
