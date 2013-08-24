@@ -77,6 +77,7 @@ enum {
   PAINT,
   AFTER_PAINT,
   RESUME_EVENTS,
+  REQUEST_PHASE,
   LAST_SIGNAL
 };
 
@@ -236,6 +237,27 @@ gdk_frame_clock_class_init (GdkFrameClockClass *klass)
                   NULL, NULL,
                   g_cclosure_marshal_VOID__VOID,
                   G_TYPE_NONE, 0);
+
+  /**
+   * GdkFrameClock::phase-requested:
+   * @clock: the frame clock emitting the signal
+   * @request_phase: the requested phase
+   *
+   * This signal is emitted when the toolkit requests a new frame
+   * clock phase. Backends may use this to unfreeze the frame
+   * clock upon a new phase request
+   */
+  signals[REQUEST_PHASE] =
+    g_signal_new (g_intern_static_string ("request-phase"),
+                  GDK_TYPE_FRAME_CLOCK,
+                  G_SIGNAL_RUN_LAST,
+                  0,
+                  NULL, NULL,
+                  g_cclosure_marshal_VOID__INT,
+                  G_TYPE_NONE,
+                  1,
+                  G_TYPE_INT,
+                  NULL);
 }
 
 static void

@@ -490,6 +490,12 @@ gdk_frame_clock_idle_request_phase (GdkFrameClock      *clock,
   GdkFrameClockIdlePrivate *priv = clock_idle->priv;
 
   priv->requested |= phase;
+
+  /* We should emit the signal here so that any backend interested
+   * in unfreezing the frame clock can do so before we call
+   * maybe_start_idle */
+  g_signal_emit_by_name (clock, "request-phase", phase);
+
   maybe_start_idle (clock_idle);
 }
 

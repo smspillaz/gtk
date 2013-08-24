@@ -148,6 +148,7 @@ struct _GdkWindowImplWayland
 
   guint32 scale;
   gboolean pending_commit;
+  gboolean awaiting_update;
   gint64 pending_frame_counter;
 };
 
@@ -373,6 +374,19 @@ static const struct wl_callback_listener listener = {
 };
 
 static void
+on_frame_clock_request_phase (GdkFrameClock      *clock,
+                              GdkFrameClockPhase request_phase,
+                              GdkWindow          *window)
+{
+  GdkWindowImplWayland *impl = GDK_WINDOW_IMPL_WAYLAND (window->impl);
+  if (impl->awaiting_update)
+    {
+      impl->awaiting_update = FALSE;
+      _gdk_frame_clock_thaw (clock);
+    }
+}
+
+static void
 on_frame_clock_before_paint (GdkFrameClock *clock,
                              GdkWindow     *window)
 {
@@ -423,15 +437,26 @@ on_frame_clock_after_paint (GdkFrameClock *clock,
   GdkWaylandCairoSurfaceData *data;
   struct wl_callback *callback;
 
+  if (!impl->awaiting_update)
+    {
+      /* Always freeze the frame clock if we're not
+       * awaiting a new update so that we don't
+       * get spurious callbacks to on_frame_clock_before_paint
+       * while we wait for a new update */
+      _gdk_frame_clock_freeze (clock);
+    }
+
   if (!impl->pending_commit)
-    return;
+    {
+      impl->awaiting_update = TRUE;
+      return;
+    }
 
   impl->pending_commit = FALSE;
   impl->pending_frame_counter = gdk_frame_clock_get_frame_counter (clock);
 
   callback = wl_surface_frame (impl->surface);
   wl_callback_add_listener (callback, &listener, window);
-  _gdk_frame_clock_freeze (clock);
 
   wl_surface_commit (impl->surface);
 
@@ -552,6 +577,8 @@ _gdk_wayland_display_create_window_impl (GdkDisplay    *display,
                     G_CALLBACK (on_frame_clock_before_paint), window);
   g_signal_connect (frame_clock, "after-paint",
                     G_CALLBACK (on_frame_clock_after_paint), window);
+  g_signal_connect (frame_clock, "request-phase",
+                    G_CALLBACK (on_frame_clock_request_phase), window);
 
   g_signal_connect (screen, "monitors-changed",
                     G_CALLBACK (on_monitors_changed), window);
@@ -799,7 +826,7 @@ gdk_window_impl_wayland_begin_paint_region (GdkWindow       *window,
   data = cairo_surface_get_user_data (impl->cairo_surface,
 				      &gdk_wayland_cairo_key);
 
-  return data->busy;
+  return TRUE;
 }
 
 static void
