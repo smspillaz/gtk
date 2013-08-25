@@ -923,7 +923,8 @@ gdk_mir_window_show (GdkWindow *window, gboolean already_mapped)
       gdk_window_get_width (window),
       gdk_window_get_height (window),
       pixel_format,
-      mir_buffer_usage_software
+      mir_buffer_usage_software,
+      mir_display_output_id_invalid
     };
 
     impl->surface = mir_connection_create_surface_sync (display_mir->mir_connection,
